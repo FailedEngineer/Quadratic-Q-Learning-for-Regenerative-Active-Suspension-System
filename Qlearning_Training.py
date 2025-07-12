@@ -7,22 +7,24 @@ import matplotlib.pyplot as plt
 from Suspension_Model import QuarterCarModel
 from Road_profile import SquareWaveProfile, BumpProfile
 
+# Fix for potential Matplotlib OMP error on some systems
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 class QuadraticQLearning:
     """
-    Implements Quadratic Q-Learning for Active Suspension Control
-    as described in the research project.
-    
-    The Q-function has the form: Q(z) = z^T @ Q_matrix @ z
-    where z = [x_s, x_s_dot, x_u, x_u_dot, u, x_g]
+    Implements Quadratic Q-Learning for Active Suspension Control.
+    This version incorporates a SCALED multi-objective reward function
+    to ensure balanced learning.
     """
     
     def __init__(self, 
                  state_dim=4,
                  action_dim=1, 
                  disturbance_dim=1,
-                 learning_rate=0.01,
+                 learning_rate=0.001, # Slightly reduced learning rate for stability
                  gamma=0.95,
-                 exploration_noise=0.1):
+                 exploration_noise=0.2): # Slightly higher initial exploration
         
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -33,601 +35,425 @@ class QuadraticQLearning:
         self.gamma = gamma
         self.exploration_noise = exploration_noise
         
-        # Initialize Q-matrix with proper H∞ block structure
+        # Initialize Q-matrix with H∞ block structure
         self._initialize_hinf_q_matrix()
         
         # Optimizer for Q-matrix
         self.optimizer = optim.Adam([self.Q_matrix], lr=learning_rate)
         
-        # Multi-objective weights (can be adjusted)
-        self.weight_comfort = 0.4    # a1 for Jk (comfort)
-        self.weight_energy = 0.3     # a2 for Je (energy)  
-        self.weight_handling = 0.3   # a3 for Jg (handling)
+        # --- REWARD FUNCTION PARAMETERS (CRITICAL CHANGE) ---
+        # Multi-objective weights
+        self.weight_comfort = 0.4
+        self.weight_energy = 0.3
+        self.weight_handling = 0.3
+        
+        # Normalization factors to scale reward components to a similar range (~[-1, 1])
+        # These values prevent one objective from dominating the others.
+        self.comfort_scale = 100.0    # Expected max for acceleration² (m²/s⁴)
+        self.energy_scale = 20.0      # Expected max for power (W)
+        self.handling_scale = 0.001   # Expected max for tire deflection² (m²)
+        self.power_consumption_scale = 5.0 # Expected max for power consumed
         
         # Experience replay buffer
-        self.memory = deque(maxlen=10000)
-        self.batch_size = 32
+        self.memory = deque(maxlen=20000) # Increased memory size
+        self.batch_size = 64 # Increased batch size
 
     def _initialize_hinf_q_matrix(self):
         """
-        Initialize Q-matrix with proper H∞ control structure for zero-sum game.
-        
+        Initializes the Q-matrix with H∞ control structure.
         Structure: z = [x_s, x_s_dot, x_u, x_u_dot, u, x_g]
-                     [    State (4D)          C  D ]
-        
-        Q = [ Q_xx  Q_xu  Q_xw ]  where:
-            [ Q_xu' Q_uu  Q_uw ]  - Q_xx: State penalty matrix (4×4)
-            [ Q_xw' Q_uw' Q_ww ]  - Q_uu: Control penalty (negative for maximization)
-                                  - Q_ww: Disturbance penalty (positive for minimization)
         """
         self.Q_matrix = torch.zeros(self.total_dim, self.total_dim, dtype=torch.float32)
         
-        # Q_xx: State penalty matrix (4×4) - based on performance criteria
-        # Penalize large displacements and velocities
-        Q_xx = torch.diag(torch.tensor([1.0, 0.1, 1.0, 0.1]))  # [x_s, x_s_dot, x_u, x_u_dot]
+        # Q_xx: State penalty matrix (4×4)
+        Q_xx = torch.diag(torch.tensor([1.0, 0.1, 1.0, 0.1]))
         self.Q_matrix[:4, :4] = Q_xx
         
-        # Q_uu: Control penalty (scalar) - NEGATIVE for maximization in zero-sum game
-        self.Q_matrix[4, 4] = -0.01  # Negative because controller maximizes
+        # Q_uu: Control penalty (scalar) - NEGATIVE for maximization
+        self.Q_matrix[4, 4] = -0.01
         
         # Q_ww: Disturbance penalty (scalar) - POSITIVE for minimization
-        self.Q_matrix[5, 5] = 0.1   # Positive because disturbance minimizes
+        self.Q_matrix[5, 5] = 0.1
         
-        # Q_xu: State-control coupling (4×1) - small random initialization
+        # Initialize off-diagonal blocks with small random values
         self.Q_matrix[:4, 4] = torch.randn(4) * 0.01
-        self.Q_matrix[4, :4] = self.Q_matrix[:4, 4]  # Ensure symmetry
-        
-        # Q_xw: State-disturbance coupling (4×1) - small random initialization  
+        self.Q_matrix[4, :4] = self.Q_matrix[:4, 4]
         self.Q_matrix[:4, 5] = torch.randn(4) * 0.01
-        self.Q_matrix[5, :4] = self.Q_matrix[:4, 5]  # Ensure symmetry
-        
-        # Q_uw: Control-disturbance coupling (scalar)
+        self.Q_matrix[5, :4] = self.Q_matrix[:4, 5]
         self.Q_matrix[4, 5] = torch.randn(1) * 0.01
-        self.Q_matrix[5, 4] = self.Q_matrix[4, 5]  # Ensure symmetry
+        self.Q_matrix[5, 4] = self.Q_matrix[4, 5]
         
         self.Q_matrix.requires_grad_(True)
 
     def compute_q_value(self, z):
         """
-        Compute Q-value for augmented state-action-disturbance vector z
-        Q(z) = z^T @ Q_matrix @ z
+        Computes Q(z) = z^T @ Q_matrix @ z for a batch of z vectors.
         """
         if isinstance(z, np.ndarray):
             z = torch.FloatTensor(z)
         
-        return torch.sum(z * (self.Q_matrix @ z), dim=-1)
+        # *** BUG FIX ***
+        # The original code had `self.Q_matrix @ z`, which caused a shape
+        # mismatch for batch processing. The correct order is `z @ self.Q_matrix`.
+        # This expression now correctly computes the quadratic form for each
+        # vector in the batch.
+        q_values = torch.sum(z * (z @ self.Q_matrix), dim=-1)
+        return q_values
     
     def get_optimal_action(self, state, disturbance):
         """
-        Solve for optimal action using H∞ saddle point: max_u min_w Q(x,u,w)
-        
-        For the quadratic form Q(z) = z^T @ Q @ z, the optimal control is:
-        u* = -Q_uu^(-1) * (Q_xu^T * x + Q_uw * w)
-        
-        This assumes Q_uu < 0 (since controller maximizes Q)
+        Computes optimal action u* = -inv(Q_uu) * (Q_xu^T * x + Q_uw * w)
         """
-        state = torch.FloatTensor(state) if isinstance(state, np.ndarray) else state
-        disturbance = torch.FloatTensor([disturbance]) if isinstance(disturbance, (int, float)) else disturbance
+        state_t = torch.FloatTensor(state)
+        disturbance_t = torch.FloatTensor([disturbance])
         
-        # Extract blocks from Q-matrix
-        # Q_matrix structure: [x_s, x_s_dot, x_u, x_u_dot, u, x_g]
-        # Indices:            [ 0,    1,      2,    3,     4, 5 ]
+        Q_xu = self.Q_matrix[:4, 4]
+        Q_uu = self.Q_matrix[4, 4]
+        Q_uw = self.Q_matrix[4, 5]
         
-        Q_xu = self.Q_matrix[:4, 4]      # State-control coupling (4×1)
-        Q_uu = self.Q_matrix[4, 4]       # Control penalty (scalar)
-        Q_uw = self.Q_matrix[4, 5]       # Control-disturbance coupling (scalar)
-        
-        # Compute optimal action using H∞ formula
-        # u* = -Q_uu^(-1) * (Q_xu^T * x + Q_uw * w)
-        if abs(Q_uu) > 1e-6:  # Avoid division by zero
-            # Note: Q_uu should be negative for maximization, so this gives positive feedback
-            optimal_action = -(Q_xu @ state + Q_uw * disturbance) / Q_uu
+        if abs(Q_uu) > 1e-6:
+            optimal_action = -(Q_xu @ state_t + Q_uw * disturbance_t) / Q_uu
         else:
-            # Fallback to zero if Q_uu is too small
             optimal_action = torch.tensor(0.0)
             
         return optimal_action.item()
     
     def get_action_with_exploration(self, state, disturbance):
-        """Get action with exploration noise for training"""
+        """Gets action with exploration noise for training"""
         optimal_action = self.get_optimal_action(state, disturbance)
-        
-        # Add exploration noise
         noise = np.random.normal(0, self.exploration_noise)
         action = optimal_action + noise
-        
-        # Clip to actuator limits (from suspension model)
-        action = np.clip(action, -100.0, 100.0)
-        
-        return action
+        return np.clip(action, -100.0, 100.0)
     
-    def compute_reward(self, state, action, next_state, p_regen, x_s_ddot):
+    def compute_scaled_reward(self, state, action, p_regen, x_s_ddot):
         """
-        Compute multi-objective reward: J = a1*Jk - a2*Je + a3*Jg
+        Computes the SCALED multi-objective reward.
+        This ensures all reward components are on a similar magnitude.
         """
-        # Jk: Comfort index (minimize acceleration)
-        comfort_cost = x_s_ddot**2
+        # 1. Comfort Cost (Jk): Penalize high body acceleration
+        comfort_cost = (x_s_ddot**2) / self.comfort_scale
         
-        # Je: Energy index (maximize regeneration, minimize consumption)
-        power_consumed = abs(action * (state[1] - state[3]))  # |F * v_rel|
-        energy_reward = p_regen - 0.1 * power_consumed
+        # 2. Energy Reward (Je): Reward regeneration, penalize consumption
+        power_consumed = abs(action * (state[1] - state[3]))
+        energy_reward = (p_regen / self.energy_scale) - (power_consumed / self.power_consumption_scale)
         
-        # Jg: Handling index (minimize tire deflection)
-        tire_deflection = abs(state[2])  # |x_u| 
-        handling_cost = tire_deflection**2
+        # 3. Handling Cost (Jg): Penalize high tire deflection
+        tire_deflection = abs(state[2])
+        handling_cost = (tire_deflection**2) / self.handling_scale
         
-        # Combined reward
+        # 4. Combined, weighted, and scaled reward
         reward = (self.weight_comfort * (-comfort_cost) + 
-                 self.weight_energy * energy_reward + 
-                 self.weight_handling * (-handling_cost))
+                  self.weight_energy * energy_reward + 
+                  self.weight_handling * (-handling_cost))
         
         return reward
     
     def store_experience(self, state, action, reward, next_state, disturbance, next_disturbance):
-        """Store experience in replay buffer"""
-        self.memory.append((state.copy(), action, reward, next_state.copy(), 
-                          disturbance, next_disturbance))
+        """Stores experience in the replay buffer"""
+        self.memory.append((state, action, reward, next_state, disturbance, next_disturbance))
     
     def update_q_matrix(self):
-        """Update Q-matrix using batch of experiences"""
+        """Updates Q-matrix using a batch of experiences from memory (vectorized)."""
         if len(self.memory) < self.batch_size:
-            return
+            return 0.0 # Return 0 loss if not enough samples
         
-        # Sample batch from memory
-        batch = np.random.choice(len(self.memory), self.batch_size, replace=False)
-        batch_experiences = [self.memory[i] for i in batch]
+        # Sample a random batch from memory
+        indices = np.random.choice(len(self.memory), self.batch_size, replace=False)
+        batch = [self.memory[i] for i in indices]
         
-        total_loss = 0
+        states, actions, rewards, next_states, disturbances, next_disturbances = zip(*batch)
         
-        for state, action, reward, next_state, disturbance, next_disturbance in batch_experiences:
-            # Current Q-value
-            z_current = torch.FloatTensor(np.concatenate([state, [action], [disturbance]]))
-            q_current = self.compute_q_value(z_current)
-            
-            # Next Q-value (with optimal next action)
-            next_action = self.get_optimal_action(next_state, next_disturbance)
-            z_next = torch.FloatTensor(np.concatenate([next_state, [next_action], [next_disturbance]]))
+        # Convert all batch data to tensors
+        states_t = torch.FloatTensor(np.array(states))
+        actions_t = torch.FloatTensor(actions).unsqueeze(1)
+        rewards_t = torch.FloatTensor(rewards)
+        next_states_t = torch.FloatTensor(np.array(next_states))
+        disturbances_t = torch.FloatTensor(disturbances).unsqueeze(1)
+        next_disturbances_t = torch.FloatTensor(next_disturbances).unsqueeze(1)
+        
+        # Form the augmented state vector z for the current batch
+        z_current = torch.cat([states_t, actions_t, disturbances_t], dim=1)
+        q_current = self.compute_q_value(z_current)
+        
+        # Compute next Q-value (target) in a vectorized way
+        with torch.no_grad():
+            # *** PERFORMANCE OPTIMIZATION ***
+            # Replaced the slow for-loop with a much faster vectorized calculation.
+            Q_xu = self.Q_matrix[:4, 4]
+            Q_uu = self.Q_matrix[4, 4]
+            Q_uw = self.Q_matrix[4, 5]
+
+            if abs(Q_uu) > 1e-6:
+                # Calculate optimal actions for the entire batch at once
+                numerator = (next_states_t @ Q_xu) + (Q_uw * next_disturbances_t).squeeze()
+                next_actions_t = -(numerator / Q_uu).unsqueeze(1)
+            else:
+                next_actions_t = torch.zeros_like(actions_t)
+
+            # Form the augmented state vector for the next state batch
+            z_next = torch.cat([next_states_t, next_actions_t, next_disturbances_t], dim=1)
             q_next = self.compute_q_value(z_next)
-            
-            # Target Q-value
-            q_target = reward + self.gamma * q_next
-            
-            # Loss (TD error)
-            loss = (q_current - q_target.detach())**2
-            total_loss += loss
+            q_target = rewards_t + self.gamma * q_next
         
-        # Backward pass
+        # Compute loss (Mean Squared Bellman Error)
+        loss = nn.functional.mse_loss(q_current, q_target)
+        
+        # Backward pass and optimization
         self.optimizer.zero_grad()
-        total_loss.backward()
+        loss.backward()
         self.optimizer.step()
         
-        # Maintain H∞ structure constraints
+        # Enforce H∞ structure constraints after update
         self._enforce_hinf_structure()
+        
+        return loss.item()
 
     def _enforce_hinf_structure(self):
-        """
-        Enforce H∞ structure constraints after each update:
-        1. Maintain symmetry
-        2. Keep Q_uu negative (for maximization)
-        3. Keep Q_ww positive (for minimization)
-        """
+        """Enforces symmetry and game-theoretic constraints on Q-matrix"""
         with torch.no_grad():
-            # Ensure symmetry
             self.Q_matrix.data = (self.Q_matrix.data + self.Q_matrix.data.T) / 2
-            
-            # Enforce game-theoretic structure
-            # Q_uu should be negative (controller maximizes)
             if self.Q_matrix[4, 4] > -1e-6:
                 self.Q_matrix[4, 4] = -1e-6
-                
-            # Q_ww should be positive (disturbance minimizes)  
             if self.Q_matrix[5, 5] < 1e-6:
                 self.Q_matrix[5, 5] = 1e-6
 
     def save_agent(self, filepath):
-        """Save the trained Q-matrix and agent parameters"""
+        """Saves the trained agent's state"""
         save_dict = {
             'Q_matrix': self.Q_matrix.detach().numpy(),
-            'state_dim': self.state_dim,
-            'action_dim': self.action_dim,
-            'disturbance_dim': self.disturbance_dim,
-            'weights': {
-                'comfort': self.weight_comfort,
-                'energy': self.weight_energy,
-                'handling': self.weight_handling
-            },
             'hyperparams': {
-                'learning_rate': self.learning_rate,
-                'gamma': self.gamma,
-                'exploration_noise': self.exploration_noise
+                'lr': self.learning_rate, 'gamma': self.gamma, 'noise': self.exploration_noise
+            },
+            'weights': {
+                'comfort': self.weight_comfort, 'energy': self.weight_energy, 'handling': self.weight_handling
             }
         }
         np.save(filepath, save_dict)
         print(f"Agent saved to {filepath}")
     
     def load_agent(self, filepath):
-        """Load a trained Q-matrix and agent parameters"""
-        save_dict = np.load(filepath, allow_pickle=True).item()
-        
-        self.Q_matrix = torch.FloatTensor(save_dict['Q_matrix'])
+        """Loads a trained agent's state"""
+        data = np.load(filepath, allow_pickle=True).item()
+        self.Q_matrix = torch.FloatTensor(data['Q_matrix'])
         self.Q_matrix.requires_grad_(True)
-        
-        # Update optimizer with loaded Q-matrix
         self.optimizer = optim.Adam([self.Q_matrix], lr=self.learning_rate)
-        
-        # Load weights and hyperparams
-        weights = save_dict['weights']
-        self.weight_comfort = weights['comfort']
-        self.weight_energy = weights['energy'] 
-        self.weight_handling = weights['handling']
-        
         print(f"Agent loaded from {filepath}")
-    
-    def get_training_info(self):
-        """Get current training state information"""
-        info = {
-            'Q_matrix_norm': torch.norm(self.Q_matrix).item(),
-            'Q_uu': self.Q_matrix[4,4].item(),
-            'Q_ww': self.Q_matrix[5,5].item(),
-            'exploration_noise': self.exploration_noise,
-            'memory_size': len(self.memory)
-        }
-        return info
 
 class SuspensionEnvironment:
     """Environment wrapper for the suspension system"""
-    
     def __init__(self, dt=0.001, episode_length=5.0):
         self.suspension = QuarterCarModel(dt=dt)
         self.road_profile = SquareWaveProfile(period=2.0, amplitude=0.02)
-        
         self.dt = dt
         self.episode_length = episode_length
         self.max_steps = int(episode_length / dt)
-        
         self.reset()
     
     def reset(self):
-        """Reset environment to initial state"""
         self.suspension.reset()
         self.current_step = 0
         self.current_time = 0.0
         return self.suspension.state
     
     def step(self, action):
-        """Take one step in the environment"""
-        # Get current road disturbance
         road_input = self.road_profile.get_profile(self.current_time)
-        
-        # Step the suspension model
         next_state, x_s_ddot, p_regen = self.suspension.step(action, road_input)
-        
-        # Update time
         self.current_time += self.dt
         self.current_step += 1
-        
-        # Check if episode is done
         done = self.current_step >= self.max_steps
-        
-        # Get next road input for next step
         next_road_input = self.road_profile.get_profile(self.current_time)
-        
         return next_state, x_s_ddot, p_regen, road_input, next_road_input, done
 
-def train_quadratic_q_learning(episodes=1000, 
-                              save_path="trained_suspension_agent.npy",
-                              convergence_window=100,
-                              min_improvement=0.001,
-                              verbose=True):
-    """
-    Main training loop with saving and convergence monitoring
+def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agent_v2.npy"):
+    """Main training loop with the corrected reward function."""
     
-    Args:
-        episodes (int): Maximum number of episodes to train
-        save_path (str): Where to save the trained agent
-        convergence_window (int): Window to check for convergence
-        min_improvement (float): Minimum improvement to continue training
-        verbose (bool): Print training progress
-    
-    Returns:
-        tuple: (trained_agent, training_metrics)
-    """
-    
-    # Initialize environment and agent
     env = SuspensionEnvironment()
     agent = QuadraticQLearning()
     
-    # Training metrics
-    episode_rewards = []
-    comfort_metrics = []
-    energy_metrics = []
-    q_matrix_norms = []
+    # --- METRICS FOR PLOTTING ---
+    metrics = {
+        'episode_rewards': [], 'avg_rewards': [], 'td_losses': [],
+        'comfort_scores': [], 'energy_scores': [], 'q_matrix_norms': []
+    }
     
-    print(f"🚀 Starting Training...")
-    print(f"📊 Episodes: {episodes}")
-    print(f"⏱️  Episode Length: {env.episode_length}s ({env.max_steps} steps)")
-    print(f"🎯 Multi-objective weights: Comfort={agent.weight_comfort}, Energy={agent.weight_energy}, Handling={agent.weight_handling}")
-    print("-" * 50)
-    
-    best_avg_reward = float('-inf')
-    episodes_without_improvement = 0
+    print("🚀 Starting Training with SCALED REWARD FUNCTION...")
+    print(f"Hyperparams: LR={agent.learning_rate}, Gamma={agent.gamma}, Initial Noise={agent.exploration_noise}")
+    print(f"Reward Weights: Comfort={agent.weight_comfort}, Energy={agent.weight_energy}, Handling={agent.weight_handling}")
+    print("-" * 60)
     
     for episode in range(episodes):
         state = env.reset()
-        episode_reward = 0
-        episode_comfort = 0
-        episode_energy = 0
+        episode_reward, episode_comfort, episode_energy, episode_loss = 0, 0, 0, 0
         step_count = 0
         
-        # Get initial road input
         road_input = env.road_profile.get_profile(0.0)
         
-        # Episode simulation loop
         while True:
-            # Get action from agent
             action = agent.get_action_with_exploration(state, road_input)
-            
-            # Take step in environment (calls YOUR suspension model)
             next_state, x_s_ddot, p_regen, current_road, next_road, done = env.step(action)
             
-            # Compute multi-objective reward
-            reward = agent.compute_reward(state, action, next_state, p_regen, x_s_ddot)
+            # *** USE THE SCALED REWARD FUNCTION ***
+            reward = agent.compute_scaled_reward(state, action, p_regen, x_s_ddot)
             
-            # Store experience for Q-matrix learning
             agent.store_experience(state, action, reward, next_state, current_road, next_road)
             
-            # Update metrics
+            loss = agent.update_q_matrix()
+            
             episode_reward += reward
             episode_comfort += x_s_ddot**2
             episode_energy += p_regen
+            episode_loss += loss
             step_count += 1
             
-            # Update state
             state = next_state
             road_input = next_road
             
             if done:
                 break
         
-        # Update Q-matrix using experience replay
-        agent.update_q_matrix()
+        # Store metrics
+        metrics['episode_rewards'].append(episode_reward)
+        metrics['comfort_scores'].append(episode_comfort / step_count)
+        metrics['energy_scores'].append(episode_energy)
+        # Avoid division by zero if episode has no steps
+        avg_loss = episode_loss / step_count if step_count > 0 else 0
+        metrics['td_losses'].append(avg_loss)
+        metrics['q_matrix_norms'].append(torch.norm(agent.Q_matrix).item())
         
-        # Store episode metrics
-        episode_rewards.append(episode_reward)
-        comfort_metrics.append(episode_comfort / step_count)  # Average per step
-        energy_metrics.append(episode_energy)
-        
-        # Track Q-matrix evolution
-        training_info = agent.get_training_info()
-        q_matrix_norms.append(training_info['Q_matrix_norm'])
+        # Calculate moving average reward for better trend visualization
+        avg_reward = np.mean(metrics['episode_rewards'][-100:])
+        metrics['avg_rewards'].append(avg_reward)
         
         # Decay exploration noise
         agent.exploration_noise = max(0.01, agent.exploration_noise * 0.995)
         
-        # Check for convergence
-        if episode >= convergence_window:
-            recent_rewards = episode_rewards[-convergence_window:]
-            avg_reward = np.mean(recent_rewards)
-            
-            if avg_reward > best_avg_reward + min_improvement:
-                best_avg_reward = avg_reward
-                episodes_without_improvement = 0
-            else:
-                episodes_without_improvement += 1
-        
-        # Verbose output
-        if verbose and episode % 100 == 0:
-            avg_reward = np.mean(episode_rewards[-100:]) if episode >= 100 else np.mean(episode_rewards)
-            avg_comfort = np.mean(comfort_metrics[-100:]) if episode >= 100 else np.mean(comfort_metrics)
-            avg_energy = np.mean(energy_metrics[-100:]) if episode >= 100 else np.mean(energy_metrics)
-            
-            print(f"Episode {episode:4d} | "
-                  f"Reward: {avg_reward:8.3f} | "
-                  f"Comfort: {avg_comfort:8.3f} | "
-                  f"Energy: {avg_energy:6.2f} | "
-                  f"Q_uu: {training_info['Q_uu']:6.3f} | "
+        if episode % 50 == 0 or episode == episodes - 1:
+            print(f"Ep {episode:4d}/{episodes} | Avg Reward: {avg_reward:8.3f} | "
+                  f"Avg Loss: {metrics['td_losses'][-1]:.4f} | "
                   f"Noise: {agent.exploration_noise:.3f}")
-        
-        # Early stopping if converged
-        if episodes_without_improvement >= convergence_window * 2:
-            print(f"\n✅ Converged after {episode} episodes!")
-            break
     
-    # Save the trained agent
     agent.save_agent(save_path)
-    
-    # Final training summary
-    print(f"\n🎉 Training Complete!")
-    print(f"📁 Agent saved to: {save_path}")
-    print(f"📈 Final average reward: {np.mean(episode_rewards[-100:]):.3f}")
-    print(f"🛡️  Final Q_uu (control penalty): {training_info['Q_uu']:.6f}")
-    print(f"⚡ Final Q_ww (disturbance penalty): {training_info['Q_ww']:.6f}")
-    
-    # Package training results
-    training_metrics = {
-        'episode_rewards': episode_rewards,
-        'comfort_metrics': comfort_metrics,
-        'energy_metrics': energy_metrics,
-        'q_matrix_norms': q_matrix_norms,
-        'final_q_matrix': agent.Q_matrix.detach().numpy(),
-        'training_info': training_info
-    }
-    
-    return agent, training_metrics
+    print("\n🎉 Training Complete!")
+    return agent, metrics
 
-def test_trained_agent(agent_path="trained_suspension_agent.npy", test_duration=10.0):
-    """
-    Test a trained agent on different road profiles
-    """
-    # Load trained agent
-    agent = QuadraticQLearning()
-    agent.load_agent(agent_path)
-    agent.exploration_noise = 0.0  # No exploration during testing
-    
-    # Test environment
-    env = SuspensionEnvironment(episode_length=test_duration)
-    
-    # Test on different road profiles
-    test_profiles = [
-        ("Square Wave", SquareWaveProfile(period=2.0, amplitude=0.02)),
-        ("Bump", BumpProfile(start_time=2.0, duration=1.0, height=0.05)),
-    ]
-    
-    results = {}
-    
-    for profile_name, road_profile in test_profiles:
-        env.road_profile = road_profile
-        state = env.reset()
-        
-        # Track performance metrics
-        comfort_score = 0
-        energy_recovered = 0
-        handling_score = 0
-        step_count = 0
-        
-        states_history = []
-        actions_history = []
-        road_history = []
-        
-        road_input = env.road_profile.get_profile(0.0)
-        
-        while True:
-            # Get action (no exploration)
-            action = agent.get_optimal_action(state, road_input)
-            
-            # Step environment
-            next_state, x_s_ddot, p_regen, current_road, next_road, done = env.step(action)
-            
-            # Update metrics
-            comfort_score += x_s_ddot**2
-            energy_recovered += p_regen
-            handling_score += abs(state[2])**2  # tire deflection
-            step_count += 1
-            
-            # Store for plotting
-            states_history.append(state.copy())
-            actions_history.append(action)
-            road_history.append(current_road)
-            
-            state = next_state
-            road_input = next_road
-            
-            if done:
-                break
-        
-        # Store results
-        results[profile_name] = {
-            'comfort_score': comfort_score / step_count,
-            'energy_recovered': energy_recovered,
-            'handling_score': handling_score / step_count,
-            'states': np.array(states_history),
-            'actions': np.array(actions_history),
-            'road_inputs': np.array(road_history),
-            'time': np.arange(step_count) * env.dt
-        }
-        
-        print(f"{profile_name} Test Results:")
-        print(f"  Comfort Score (lower=better): {results[profile_name]['comfort_score']:.6f}")
-        print(f"  Energy Recovered: {results[profile_name]['energy_recovered']:.3f} W")
-        print(f"  Handling Score (lower=better): {results[profile_name]['handling_score']:.6f}")
-        print()
-    
-    return results
+def plot_training_results(metrics):
+    """Plots the key metrics from the training process."""
+    plt.figure(figsize=(18, 10))
+    plt.suptitle("Training Performance with Scaled Rewards", fontsize=16)
 
-# Example usage
-if __name__ == "__main__":
-    print("🔧 Quadratic Q-Learning for Active Suspension Control")
-    print("=" * 50)
-    
-    # Training
-    print("Starting training...")
-    trained_agent, training_metrics = train_quadratic_q_learning(
-        episodes=500,
-        save_path="suspension_agent.npy",
-        verbose=True
-    )
-    
-    # Plot training results
-    plt.figure(figsize=(15, 10))
-    
+    # Plot 1: Episode and Average Rewards
     plt.subplot(2, 3, 1)
-    plt.plot(training_metrics['episode_rewards'])
+    plt.plot(metrics['episode_rewards'], alpha=0.5, label='Episode Reward')
+    plt.plot(metrics['avg_rewards'], color='red', linewidth=2, label='100-Ep Avg Reward')
     plt.title('Episode Rewards')
     plt.xlabel('Episode')
     plt.ylabel('Total Reward')
+    plt.legend()
     plt.grid(True)
     
+    # Plot 2: TD Loss
     plt.subplot(2, 3, 2)
-    plt.plot(training_metrics['comfort_metrics'])
+    plt.plot(metrics['td_losses'])
+    plt.title('Average TD Loss')
+    plt.xlabel('Episode')
+    plt.ylabel('MSE Loss')
+    plt.grid(True)
+
+    # Plot 3: Comfort Metric
+    plt.subplot(2, 3, 3)
+    plt.plot(metrics['comfort_scores'])
     plt.title('Comfort Metric (Lower is Better)')
     plt.xlabel('Episode')
     plt.ylabel('Average Acceleration²')
+    plt.yscale('log') # Use log scale as it can vary a lot initially
     plt.grid(True)
     
-    plt.subplot(2, 3, 3)
-    plt.plot(training_metrics['energy_metrics'])
+    # Plot 4: Energy Recovery
+    plt.subplot(2, 3, 4)
+    plt.plot(metrics['energy_scores'])
     plt.title('Energy Recovery')
     plt.xlabel('Episode')
     plt.ylabel('Total Regenerated Power (W)')
     plt.grid(True)
     
-    plt.subplot(2, 3, 4)
-    plt.plot(training_metrics['q_matrix_norms'])
-    plt.title('Q-Matrix Evolution')
-    plt.xlabel('Episode')
-    plt.ylabel('Q-Matrix Frobenius Norm')
-    plt.grid(True)
-    
+    # Plot 5: Q-Matrix Norm
     plt.subplot(2, 3, 5)
-    final_q = training_metrics['final_q_matrix']
-    plt.imshow(final_q, cmap='RdBu_r', vmin=-np.max(np.abs(final_q)), vmax=np.max(np.abs(final_q)))
-    plt.title('Final Q-Matrix Structure')
-    plt.colorbar()
-    labels = ['x_s', 'x_s_dot', 'x_u', 'x_u_dot', 'u', 'x_g']
-    plt.xticks(range(6), labels)
-    plt.yticks(range(6), labels)
-    
-    plt.subplot(2, 3, 6)
-    # Show Q_uu and Q_ww evolution to verify game structure
-    q_uu_history = [training_metrics['final_q_matrix'][4,4]] * len(training_metrics['episode_rewards'])
-    q_ww_history = [training_metrics['final_q_matrix'][5,5]] * len(training_metrics['episode_rewards'])
-    plt.plot(q_uu_history, label='Q_uu (should be negative)', color='red')
-    plt.plot(q_ww_history, label='Q_ww (should be positive)', color='blue')
-    plt.title('Game Structure Parameters')
+    plt.plot(metrics['q_matrix_norms'])
+    plt.title('Q-Matrix Evolution (Frobenius Norm)')
     plt.xlabel('Episode')
-    plt.ylabel('Value')
-    plt.legend()
+    plt.ylabel('Norm')
     plt.grid(True)
     
-    plt.tight_layout()
+    # Plot 6: Final Q-Matrix
+    plt.subplot(2, 3, 6)
+    # Need to get the agent from the return of the training function to plot
+    # This part will be handled in the main execution block
+    plt.title('Final Q-Matrix Structure (placeholder)')
+    plt.text(0.5, 0.5, 'Plot after training', ha='center', va='center')
+
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Train the agent
+    agent, training_metrics = train_quadratic_q_learning(episodes=500)
+    
+    # Plot the results, including the final Q-matrix
+    # Get the final Q-matrix from the trained agent
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle("Training Performance with Scaled Rewards", fontsize=16)
+    
+    axes = axes.flatten()
+
+    axes[0].plot(training_metrics['episode_rewards'], alpha=0.5, label='Episode Reward')
+    axes[0].plot(training_metrics['avg_rewards'], color='red', linewidth=2, label='100-Ep Avg Reward')
+    axes[0].set_title('Episode Rewards')
+    axes[0].set_xlabel('Episode')
+    axes[0].set_ylabel('Total Reward')
+    axes[0].legend()
+    axes[0].grid(True)
+    
+    axes[1].plot(training_metrics['td_losses'])
+    axes[1].set_title('Average TD Loss')
+    axes[1].set_xlabel('Episode')
+    axes[1].set_ylabel('MSE Loss')
+    axes[1].grid(True)
+
+    axes[2].plot(training_metrics['comfort_scores'])
+    axes[2].set_title('Comfort Metric (Lower is Better)')
+    axes[2].set_xlabel('Episode')
+    axes[2].set_ylabel('Average Acceleration²')
+    axes[2].set_yscale('log')
+    axes[2].grid(True)
+    
+    axes[3].plot(training_metrics['energy_scores'])
+    axes[3].set_title('Energy Recovery')
+    axes[3].set_xlabel('Episode')
+    axes[3].set_ylabel('Total Regenerated Power (W)')
+    axes[3].grid(True)
+    
+    axes[4].plot(training_metrics['q_matrix_norms'])
+    axes[4].set_title('Q-Matrix Evolution (Frobenius Norm)')
+    axes[4].set_xlabel('Episode')
+    axes[4].set_ylabel('Norm')
+    axes[4].grid(True)
+    
+    final_q = agent.Q_matrix.detach().numpy()
+    im = axes[5].imshow(final_q, cmap='RdBu_r', vmin=-np.max(np.abs(final_q)), vmax=np.max(np.abs(final_q)))
+    axes[5].set_title('Final Q-Matrix Structure')
+    labels = ['x_s', 'ẋ_s', 'x_u', 'ẋ_u', 'u', 'x_g']
+    axes[5].set_xticks(range(6), labels, rotation=45)
+    axes[5].set_yticks(range(6), labels)
+    fig.colorbar(im, ax=axes[5])
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
     
-    # Testing
-    print("\n🧪 Testing trained agent...")
-    test_results = test_trained_agent("suspension_agent.npy", test_duration=5.0)
-    
-    # Plot test results
-    plt.figure(figsize=(15, 8))
-    
-    for i, (profile_name, data) in enumerate(test_results.items()):
-        plt.subplot(2, len(test_results), i + 1)
-        plt.plot(data['time'], data['states'][:, 0], label='x_s (sprung mass)')
-        plt.plot(data['time'], data['states'][:, 2], label='x_u (unsprung mass)')
-        plt.plot(data['time'], data['road_inputs'], label='Road input', alpha=0.7)
-        plt.title(f'{profile_name} - Displacements')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Displacement (m)')
-        plt.legend()
-        plt.grid(True)
-        
-        plt.subplot(2, len(test_results), i + 1 + len(test_results))
-        plt.plot(data['time'], data['actions'])
-        plt.title(f'{profile_name} - Control Actions')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Force (N)')
-        plt.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    print("✅ Training and testing completed!")
+    # You can now proceed to test this newly trained agent
+    # For example:
+    # from reward_analysis import test_trained_agent_comprehensive, plot_comprehensive_results
+    # test_results = test_trained_agent_comprehensive("trained_suspension_agent_v2.npy")
+    # if test_results:
+    #     plot_comprehensive_results(test_results)
