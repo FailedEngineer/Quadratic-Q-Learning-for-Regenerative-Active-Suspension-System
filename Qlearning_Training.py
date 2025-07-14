@@ -41,15 +41,19 @@ class QuadraticQLearning:
         self._initialize_hinf_q_matrix()
         self.optimizer = optim.Adam([self.Q_matrix], lr=learning_rate)
         
-        # --- REWARD FUNCTION PARAMETERS ---
+        # --- REWARD FUNCTION PARAMETERS (RE-BALANCED) ---
         self.weight_comfort = 0.4
-        self.weight_energy = 0.3
-        self.weight_handling = 0.3
-        self.comfort_scale = 100.0
-        self.energy_scale = 20.0
-        self.handling_scale = 0.001
-        self.power_consumption_scale = 5.0
+        self.weight_energy = 0.2
+        self.weight_handling = 0.4
         
+        # --- NEW SCALING FACTORS ---
+        # These factors normalize the costs. Adjust them based on typical
+        # values observed during a passive run to make them comparable.
+        self.comfort_scale = 10.0    # Expected RMS of body acceleration
+        self.handling_scale = 0.05  # Expected RMS of tire deflection
+        self.power_consumption_scale = 100.0 # Expected RMS of power consumed
+        self.energy_regen_scale = 50.0 # Expected RMS of power regenerated
+
         self.memory = deque(maxlen=20000)
         self.batch_size = 64
 
@@ -95,16 +99,30 @@ class QuadraticQLearning:
         action = optimal_action + noise
         return np.clip(action, -100.0, 100.0)
     
-    def compute_scaled_reward(self, state, action, p_regen, x_s_ddot):
-        """Computes the SCALED multi-objective reward."""
-        comfort_cost = (x_s_ddot**2) / self.comfort_scale
-        power_consumed = abs(action * (state[1] - state[3]))
-        energy_reward = (p_regen / self.energy_scale) - (power_consumed / self.power_consumption_scale)
-        tire_deflection = abs(state[2])
-        handling_cost = (tire_deflection**2) / self.handling_scale
-        reward = (self.weight_comfort * (-comfort_cost) + 
-                  self.weight_energy * energy_reward + 
-                  self.weight_handling * (-handling_cost))
+    def compute_scaled_reward(self, state, action, x_s_ddot, p_regen, x_g):
+        """
+        Computes the SCALED multi-objective reward based on the project proposal.
+        J_k: Passenger Comfort, J_g: Road Handling, J_e: Energy
+        """
+        # 1. Comfort Cost (J_k): Penalize body acceleration (m/s^2)
+        comfort_cost = (x_s_ddot**2) / self.comfort_scale**2
+
+        # 2. Handling Cost (J_g): Penalize tire deflection from the road (m)
+        #    This is the difference between the wheel's position and the road's position.
+        tire_deflection = state[2] - x_g  # x_u - x_g
+        handling_cost = (tire_deflection**2) / self.handling_scale**2
+        
+        # 3. Net Energy Cost (J_e): Penalize actuator power usage and reward regeneration
+        relative_velocity = state[1] - state[3]  # x_s_dot - x_u_dot
+        power_consumed = (action * relative_velocity)**2 / self.power_consumption_scale**2
+        power_regenerated = p_regen / self.energy_regen_scale
+        
+        # The goal is to MINIMIZE cost, so rewards are negative costs.
+        # We maximize the reward: R = -w_c*J_k - w_h*J_g + w_e*J_e_net
+        reward = (self.weight_comfort * (-comfort_cost) +
+                  self.weight_handling * (-handling_cost) +
+                  self.weight_energy * (power_regenerated - power_consumed))
+
         return reward
     
     def store_experience(self, state, action, reward, next_state, disturbance, next_disturbance):
@@ -146,6 +164,7 @@ class QuadraticQLearning:
         loss = nn.functional.mse_loss(q_current, q_target)
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.Q_matrix, 1.0)
         self.optimizer.step()
         self._enforce_hinf_structure()
         return loss.item()
@@ -327,7 +346,7 @@ def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agen
             while True:
                 action = agent.get_action_with_exploration(state, road_input)
                 next_state, x_s_ddot, p_regen, current_road, next_road, done = env.step(action)
-                reward = agent.compute_scaled_reward(state, action, p_regen, x_s_ddot)
+                reward = agent.compute_scaled_reward(state, action,x_s_ddot, p_regen,current_road)
                 agent.store_experience(state, action, reward, next_state, current_road, next_road)
                 loss = agent.update_q_matrix()
                 
@@ -368,7 +387,7 @@ def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agen
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    agent, training_metrics = train_quadratic_q_learning(episodes=7000)
+    agent, training_metrics = train_quadratic_q_learning(episodes=10000)
     
     if training_metrics:
         plot_training_results(training_metrics, agent, save_path="final_training_plot.png")

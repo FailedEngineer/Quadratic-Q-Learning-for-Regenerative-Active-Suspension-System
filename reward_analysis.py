@@ -94,7 +94,8 @@ def test_trained_agent_comprehensive(agent_path, test_duration=10.0):
         suspension.reset()
         state = suspension.state.copy()
         
-        time_history, state_history, action_history, road_history, acceleration_history = [], [], [], [], []
+        # *** ADDED p_regen_history TO LOG REGENERATED POWER ***
+        time_history, state_history, action_history, road_history, acceleration_history, p_regen_history = [], [], [], [], [], []
         
         for step in range(max_steps):
             current_time = step * dt
@@ -119,6 +120,8 @@ def test_trained_agent_comprehensive(agent_path, test_duration=10.0):
             action_history.append(action)
             road_history.append(road_input)
             acceleration_history.append(x_s_ddot)
+            # *** ADDED: Log the regenerated power at each step ***
+            p_regen_history.append(p_regen)
             
             state = next_state.copy()
         
@@ -128,6 +131,8 @@ def test_trained_agent_comprehensive(agent_path, test_duration=10.0):
         action_history = np.array(action_history)
         road_history = np.array(road_history)
         acceleration_history = np.array(acceleration_history)
+        # *** ADDED: Convert power history to numpy array ***
+        p_regen_history = np.array(p_regen_history)
         
         results[scenario_name] = {
             'time': time_history,
@@ -135,24 +140,31 @@ def test_trained_agent_comprehensive(agent_path, test_duration=10.0):
             'actions': action_history,
             'road_inputs': road_history,
             'accelerations': acceleration_history,
+            # *** ADDED: Store the power history in the results ***
+            'regenerated_power': p_regen_history,
             'performance_metrics': {
                 'rms_acceleration': np.sqrt(np.mean(acceleration_history**2)),
                 'max_acceleration': np.max(np.abs(acceleration_history)),
                 'max_control_force': np.max(np.abs(action_history)),
                 'rms_control_force': np.sqrt(np.mean(action_history**2)),
+                # *** ADDED: New metric for total energy recovered ***
+                'total_energy_recovered_J': np.sum(p_regen_history) * dt
             }
         }
         
         metrics = results[scenario_name]['performance_metrics']
         print(f"   📈 RMS Acceleration: {metrics['rms_acceleration']:.4f} m/s²")
         print(f"   🎮 RMS Control Force: {metrics['rms_control_force']:.2f} N")
-    
+        # *** ADDED: Print the new energy metric ***
+        print(f"   ⚡️ Total Energy Recovered: {metrics['total_energy_recovered_J']:.2f} Joules")
+
     return results
 
 def plot_comprehensive_results(results):
     """Create comprehensive plots of the test results."""
     n_scenarios = len(results)
     fig, axes = plt.subplots(2, n_scenarios, figsize=(20, 10), sharey='row')
+    fig.suptitle('Suspension Displacement Analysis', fontsize=16)
     
     colors = ['blue', 'red', 'green', 'orange', 'purple']
     
@@ -170,22 +182,56 @@ def plot_comprehensive_results(results):
         ax1.legend()
         ax1.grid(True)
         
-        # Plot 2: Control Actions
+        # Plot 2: Body Acceleration (useful for seeing comfort)
         ax2 = axes[1, i]
-        ax2.plot(data['time'], data['actions'], color=color)
-        ax2.set_title(f'{scenario_name}\nControl Actions')
+        ax2.plot(data['time'], data['accelerations'], color=color)
+        ax2.set_title(f'{scenario_name}\nBody Acceleration')
         ax2.set_xlabel('Time (s)')
-        if i == 0: ax2.set_ylabel('Force (N)')
+        if i == 0: ax2.set_ylabel('Acceleration (m/s²)')
         ax2.grid(True)
     
-    plt.tight_layout()
-    plt.show()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+
+# *** NEW PLOTTING FUNCTION FOR ENERGY AND FORCE ***
+def plot_energy_and_force_results(results):
+    """Create dedicated plots for control force and regenerated power."""
+    n_scenarios = len(results)
+    # Create a new figure, which will result in a new window
+    fig, axes = plt.subplots(2, n_scenarios, figsize=(20, 10), sharey='row')
+    fig.suptitle('Control Force and Energy Regeneration Analysis', fontsize=16)
+
+    colors = ['blue', 'red', 'green', 'orange']
+
+    for i, (scenario_name, data) in enumerate(results.items()):
+        color = colors[i % len(colors)]
+
+        # Plot 1: Control Force
+        ax1 = axes[0, i]
+        ax1.plot(data['time'], data['actions'], color=color)
+        ax1.set_title(f'{scenario_name}\nControl Actions')
+        ax1.set_xlabel('Time (s)')
+        ax1.set_ylim(-110, 110) # Set fixed y-axis for easy comparison
+        if i == 0: ax1.set_ylabel('Force (N)')
+        ax1.grid(True)
+
+        # Plot 2: Regenerated Power
+        ax2 = axes[1, i]
+        ax2.plot(data['time'], data['regenerated_power'], color=color)
+        ax2.fill_between(data['time'], data['regenerated_power'], color=color, alpha=0.3)
+        ax2.set_title(f'{scenario_name}\nRegenerated Power')
+        ax2.set_xlabel('Time (s)')
+        if i == 0: ax2.set_ylabel('Power (W)')
+        ax2.grid(True)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
 
 if __name__ == "__main__":
     print("🔍 Evaluating Latest Trained Agent")
     print("=" * 60)
     
-    # --- NEW: Automatically find the latest agent to test ---
+    # Automatically find the latest agent to test
     latest_agent_path = find_latest_agent_file()
     
     if latest_agent_path is None:
@@ -196,5 +242,11 @@ if __name__ == "__main__":
         test_results = test_trained_agent_comprehensive(agent_path=latest_agent_path, test_duration=5.0)
     
         if test_results is not None:
-            # Plot comprehensive results
+            # Plot comprehensive results in the first window
             plot_comprehensive_results(test_results)
+            
+            # *** ADDED: Call the new plotting function for the second window ***
+            plot_energy_and_force_results(test_results)
+            
+            # Show both plot windows
+            plt.show()
