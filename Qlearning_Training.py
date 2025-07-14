@@ -25,7 +25,7 @@ class QuadraticQLearning:
                  state_dim=4,
                  action_dim=1, 
                  disturbance_dim=1,
-                 learning_rate=0.001,
+                 learning_rate=0.0001,
                  gamma=0.95,
                  exploration_noise=0.2):
         
@@ -387,7 +387,7 @@ def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agen
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    agent, training_metrics = train_quadratic_q_learning(episodes=10000)
+    agent, training_metrics = train_quadratic_q_learning(episodes=15000)
     
     if training_metrics:
         plot_training_results(training_metrics, agent, save_path="final_training_plot.png")

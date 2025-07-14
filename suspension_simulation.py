@@ -1,9 +1,13 @@
+# Fix OpenMP conflict BEFORE any other imports
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.widgets import Button, Slider
 import torch
-import os
 import glob
 import re
 from collections import deque
@@ -78,13 +82,12 @@ class SuspensionSimulation:
         self.control_history = deque(maxlen=self.max_history)
         self.acceleration_history = deque(maxlen=self.max_history)
         
-        # Vehicle visual parameters
-        self.body_width = 1.5
-        self.body_height = 0.4
-        self.wheel_radius = 0.3
-        self.ground_level = -1.0
-        
-        self.setup_plot()
+        # Vehicle visual parameters - adjusted for quarter car
+        self.body_width = 1.0
+        self.body_height = 0.2
+        self.wheel_radius = 0.2
+        self.ground_level = -0.8
+        self.vehicle_x = 4.0  # Fixed x position for vehicle
         
     def load_latest_agent(self):
         """Load the most recent trained agent."""
@@ -104,16 +107,29 @@ class SuspensionSimulation:
         else:
             print("⚠️ No trained agent found. Using passive control only.")
     
+    def change_road_profile(self, road_name):
+        """Change the current road profile."""
+        if road_name in self.road_profiles:
+            self.current_road_name = road_name
+            self.current_road = self.road_profiles[road_name]
+            print(f"🛣️ Changed road profile to: {road_name}")
+        else:
+            print(f"⚠️ Unknown road profile: {road_name}")
+            print(f"Available profiles: {list(self.road_profiles.keys())}")
+    
     def setup_plot(self):
         """Initialize the matplotlib figure and subplots."""
+        plt.style.use('default')  # Ensure consistent styling
+        
         self.fig = plt.figure(figsize=(16, 10))
+        self.fig.suptitle('Active Suspension System - Real-Time Simulation', fontsize=16, fontweight='bold')
         
         # Main vehicle visualization (top)
         self.ax_main = plt.subplot(3, 2, (1, 2))
-        self.ax_main.set_xlim(-2, 8)
-        self.ax_main.set_ylim(-2, 2)
+        self.ax_main.set_xlim(2, 6)  # Tighter focus on vehicle
+        self.ax_main.set_ylim(-1.2, 1.0)
         self.ax_main.set_aspect('equal')
-        self.ax_main.set_title('Active Suspension System - Real-Time Simulation')
+        self.ax_main.set_title('Quarter Car Suspension System')
         self.ax_main.grid(True, alpha=0.3)
         
         # Time-series plots
@@ -143,42 +159,50 @@ class SuspensionSimulation:
         
     def init_visual_elements(self):
         """Initialize the visual elements of the simulation."""
-        # Road surface
-        road_x = np.linspace(-2, 8, 200)
+        # Road surface - simple horizontal line
+        road_x = np.linspace(2, 6, 100)
         road_y = [self.ground_level + self.get_road_height(x) for x in road_x]
-        self.road_line, = self.ax_main.plot(road_x, road_y, 'k-', linewidth=3, label='Road')
+        self.road_line, = self.ax_main.plot(road_x, road_y, 'k-', linewidth=4, label='Road Surface')
         
-        # Vehicle body (rectangle)
+        # Vehicle body (sprung mass) - rectangular
         self.body_rect = plt.Rectangle((0, 0), self.body_width, self.body_height, 
-                                     color='blue', alpha=0.7, label='Vehicle Body')
+                                     color='blue', alpha=0.8, label='Vehicle Body (ms)')
         self.ax_main.add_patch(self.body_rect)
         
-        # Wheel (circle)
-        self.wheel = plt.Circle((0, 0), self.wheel_radius, color='gray', label='Wheel')
+        # Wheel (unsprung mass) - circular
+        self.wheel = plt.Circle((0, 0), self.wheel_radius, color='darkgray', 
+                               alpha=0.9, label='Wheel (mu)')
         self.ax_main.add_patch(self.wheel)
         
-        # Spring (zigzag line)
-        self.spring_line, = self.ax_main.plot([], [], 'g-', linewidth=3, label='Spring')
+        # Spring (suspension spring)
+        self.spring_line, = self.ax_main.plot([], [], 'g-', linewidth=3, label='Spring (ks)')
         
-        # Damper (vertical line with symbol)
-        self.damper_line, = self.ax_main.plot([], [], 'r-', linewidth=4, label='Damper')
+        # Damper (suspension damper)
+        self.damper_line, = self.ax_main.plot([], [], 'orange', linewidth=4, label='Damper (cs)')
+        
+        # Tire spring (connection to road)
+        self.tire_spring_line, = self.ax_main.plot([], [], 'purple', linewidth=2, 
+                                                  linestyle='--', label='Tire (kt)')
         
         # Control force arrow
         self.control_arrow = self.ax_main.annotate('', xy=(0, 0), xytext=(0, 0),
                                                  arrowprops=dict(arrowstyle='->', 
-                                                               color='red', lw=3))
+                                                               color='red', lw=4))
         
         # Time-series lines
-        self.body_line, = self.ax_pos.plot([], [], 'b-', label='Body Position')
-        self.wheel_line, = self.ax_pos.plot([], [], 'g--', label='Wheel Position')
-        self.road_line_plot, = self.ax_pos.plot([], [], 'k:', label='Road Profile')
+        self.body_line, = self.ax_pos.plot([], [], 'b-', label='Body Position', linewidth=2)
+        self.wheel_line, = self.ax_pos.plot([], [], 'g--', label='Wheel Position', linewidth=2)
+        self.road_line_plot, = self.ax_pos.plot([], [], 'k:', label='Road Profile', linewidth=1)
         
-        self.control_line, = self.ax_control.plot([], [], 'r-', label='Control Force')
-        self.accel_line, = self.ax_accel.plot([], [], 'm-', label='Body Acceleration')
+        self.control_line, = self.ax_control.plot([], [], 'r-', label='Control Force', linewidth=2)
+        self.accel_line, = self.ax_accel.plot([], [], 'm-', label='Body Acceleration', linewidth=2)
         
         # Legends
-        self.ax_main.legend(loc='upper right')
-        self.ax_pos.legend()
+        self.ax_main.legend(loc='upper left', fontsize=9)
+        self.ax_pos.legend(fontsize=9)
+        
+        # Add labels for masses
+        self.mass_labels = []
         
     def setup_controls(self):
         """Setup interactive controls."""
@@ -204,12 +228,6 @@ class SuspensionSimulation:
         self.speed_slider = Slider(ax_speed, 'Speed (m/s)', 5.0, 50.0, valinit=self.road_speed)
         self.speed_slider.on_changed(self.update_speed)
         
-    def change_road_profile(self, road_name):
-        """Change the current road profile."""
-        self.current_road_name = road_name
-        self.current_road = self.road_profiles[road_name]
-        print(f"🛣️ Changed road profile to: {road_name}")
-        
     def toggle_control(self, event):
         """Toggle between active and passive control."""
         self.active_control = not self.active_control
@@ -223,23 +241,32 @@ class SuspensionSimulation:
         
     def get_road_height(self, x_position):
         """Get road height at a given x position."""
-        # Convert x position to time based on speed
-        road_time = x_position / self.road_speed
+        # For the quarter car model, we use the current time-based road profile
+        # The x_position is used for visualization only
+        road_time = self.time
         return self.current_road.get_profile(road_time)
         
-    def create_spring_points(self, x_bottom, y_bottom, x_top, y_top, coils=6):
+    def create_spring_points(self, x_bottom, y_bottom, x_top, y_top, coils=8):
         """Create zigzag points for spring visualization."""
-        n_points = coils * 4 + 1
+        n_points = coils * 2 + 1
         t = np.linspace(0, 1, n_points)
         
         # Linear interpolation for base line
         x_base = x_bottom + t * (x_top - x_bottom)
         y_base = y_bottom + t * (y_top - y_bottom)
         
-        # Add zigzag pattern
-        zigzag = 0.1 * np.sin(2 * np.pi * coils * t)
-        x_spring = x_base + zigzag * (y_top - y_bottom) / np.sqrt((x_top - x_bottom)**2 + (y_top - y_bottom)**2)
-        y_spring = y_base - zigzag * (x_top - x_bottom) / np.sqrt((x_top - x_bottom)**2 + (y_top - y_bottom)**2)
+        # Add zigzag pattern perpendicular to spring direction
+        spring_length = np.sqrt((x_top - x_bottom)**2 + (y_top - y_bottom)**2)
+        zigzag_amplitude = min(0.06, spring_length * 0.1)  # Adaptive amplitude
+        zigzag = zigzag_amplitude * np.sin(2 * np.pi * coils * t)
+        
+        # Calculate perpendicular direction
+        if abs(y_top - y_bottom) > 1e-6:  # Mostly vertical spring
+            x_spring = x_base + zigzag
+            y_spring = y_base
+        else:  # Mostly horizontal spring
+            x_spring = x_base
+            y_spring = y_base + zigzag
         
         return x_spring, y_spring
         
@@ -280,41 +307,61 @@ class SuspensionSimulation:
     
     def update_vehicle_visualization(self, state, control_force):
         """Update the main vehicle visualization."""
-        vehicle_x = 3.0  # Fixed x position for vehicle
+        # Vehicle body position (sprung mass)
+        body_y = self.ground_level + 0.6 + state[0]  # Elevated above wheel
+        self.body_rect.set_xy((self.vehicle_x - self.body_width/2, body_y))
         
-        # Vehicle body position
-        body_y = self.ground_level + 0.5 + state[0]  # Add offset for visibility
-        self.body_rect.set_xy((vehicle_x - self.body_width/2, body_y))
-        
-        # Wheel position
+        # Wheel position (unsprung mass)  
         wheel_y = self.ground_level + self.wheel_radius + state[2]
-        self.wheel.set_center((vehicle_x, wheel_y))
+        self.wheel.set_center((self.vehicle_x, wheel_y))
         
-        # Spring connection
+        # Spring connection (between body and wheel)
         spring_x, spring_y = self.create_spring_points(
-            vehicle_x - 0.2, wheel_y + self.wheel_radius,
-            vehicle_x - 0.2, body_y
+            self.vehicle_x - 0.15, wheel_y + self.wheel_radius + 0.02,
+            self.vehicle_x - 0.15, body_y
         )
         self.spring_line.set_data(spring_x, spring_y)
         
-        # Damper connection
-        damper_x = [vehicle_x + 0.2, vehicle_x + 0.2]
-        damper_y = [wheel_y + self.wheel_radius, body_y]
+        # Damper connection (parallel to spring, offset)
+        damper_x = [self.vehicle_x + 0.15, self.vehicle_x + 0.15]
+        damper_y = [wheel_y + self.wheel_radius + 0.02, body_y]
         self.damper_line.set_data(damper_x, damper_y)
         
-        # Control force arrow
+        # Tire spring (wheel to road connection)
+        road_height = self.ground_level + self.get_road_height(self.vehicle_x)
+        tire_x = [self.vehicle_x, self.vehicle_x]
+        tire_y = [road_height, wheel_y - self.wheel_radius]
+        self.tire_spring_line.set_data(tire_x, tire_y)
+        
+        # Control force arrow (actuator force)
         if abs(control_force) > 1.0:
-            arrow_scale = min(abs(control_force) / 50.0, 1.0)
-            arrow_dy = arrow_scale * 0.5 * np.sign(control_force)
-            self.control_arrow.set_position((vehicle_x + 0.5, body_y + self.body_height/2))
-            self.control_arrow.xy = (vehicle_x + 0.5, body_y + self.body_height/2 + arrow_dy)
+            arrow_scale = min(abs(control_force) / 30.0, 0.3)
+            arrow_dy = arrow_scale * np.sign(control_force)
+            arrow_start_y = (body_y + wheel_y + self.wheel_radius) / 2  # Between masses
+            self.control_arrow.set_position((self.vehicle_x + 0.4, arrow_start_y))
+            self.control_arrow.xy = (self.vehicle_x + 0.4, arrow_start_y + arrow_dy)
             self.control_arrow.set_visible(True)
         else:
             self.control_arrow.set_visible(False)
+        
+        # Update mass labels
+        if hasattr(self, 'mass_labels'):
+            for label in self.mass_labels:
+                label.remove()
+            self.mass_labels.clear()
+        else:
+            self.mass_labels = []
+            
+        # Add mass labels
+        body_label = self.ax_main.text(self.vehicle_x, body_y + self.body_height + 0.05, 
+                                      'ms', ha='center', va='bottom', fontsize=10, fontweight='bold')
+        wheel_label = self.ax_main.text(self.vehicle_x, wheel_y - self.wheel_radius - 0.1, 
+                                       'mu', ha='center', va='top', fontsize=10, fontweight='bold')
+        self.mass_labels.extend([body_label, wheel_label])
     
     def update_road_visualization(self):
         """Update the road surface visualization."""
-        road_x = np.linspace(-2, 8, 200)
+        road_x = np.linspace(2, 6, 100)
         road_y = [self.ground_level + self.get_road_height(x) for x in road_x]
         self.road_line.set_data(road_x, road_y)
     
@@ -384,21 +431,34 @@ Time: {self.time:.1f} s"""
         print("🚀 Starting Active Suspension Real-Time Simulation")
         print("Use the buttons to change road profiles and toggle control modes!")
         
+        # Setup plot first
+        self.setup_plot()
+        
         # Reset simulation
         self.suspension.reset()
         self.time = 0.0
         
-        # Create animation
-        self.ani = animation.FuncAnimation(
-            self.fig, self.update_simulation, interval=50,  # 20 FPS
-            blit=False, cache_frame_data=False
-        )
-        
-        plt.tight_layout()
-        plt.show()
+        try:
+            # Create animation
+            self.ani = animation.FuncAnimation(
+                self.fig, self.update_simulation, interval=50,  # 20 FPS
+                blit=False, cache_frame_data=False
+            )
+            
+            plt.tight_layout()
+            plt.show()
+            
+        except Exception as e:
+            print(f"❌ Animation error: {e}")
+            print("Showing static plot instead...")
+            plt.show()
 
 # Main execution
 if __name__ == "__main__":
-    # Create and start the simulation
-    sim = SuspensionSimulation(dt=0.001)  # 10ms timestep for smooth animation
-    sim.start_simulation()
+    try:
+        # Create and start the simulation
+        sim = SuspensionSimulation(dt=0.001)  # 1ms timestep for smooth animation
+        sim.start_simulation()
+    except Exception as e:
+        print(f"❌ Simulation failed: {e}")
+        print("Please check that all required files are available.")

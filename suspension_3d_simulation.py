@@ -1,10 +1,14 @@
+# Fix OpenMP conflict BEFORE any other imports
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.widgets import Button, Slider
 import torch
-import os
 import glob
 from collections import deque
 
@@ -87,7 +91,11 @@ class SuspensionSimulation3D:
         self.road_history = deque(maxlen=self.max_history)
         self.control_history = deque(maxlen=self.max_history)
         
-        self.setup_plot()
+        # Initialize 3D elements
+        self.ax_3d = None
+        self.road_surface = None
+        self.vehicle_body = None
+        self.wheels = []
         
     def load_latest_agent(self):
         """Load the most recent trained agent."""
@@ -106,13 +114,29 @@ class SuspensionSimulation3D:
         else:
             print("⚠️ No trained agent found. Using passive control only.")
     
+    def change_road_profile(self, road_name):
+        """Change the current road profile."""
+        if road_name in self.road_profiles:
+            self.current_road_name = road_name
+            self.current_road = self.road_profiles[road_name]
+            # Only update road surface if plot is already initialized
+            if hasattr(self, 'ax_3d') and self.ax_3d is not None:
+                self.update_road_surface()
+            print(f"🛣️ Changed road profile to: {road_name}")
+        else:
+            print(f"⚠️ Unknown road profile: {road_name}")
+            print(f"Available profiles: {list(self.road_profiles.keys())}")
+    
     def setup_plot(self):
         """Initialize the 3D plot."""
+        plt.style.use('default')  # Ensure consistent styling
+        
         self.fig = plt.figure(figsize=(16, 12))
+        self.fig.suptitle('3D Active Suspension System Simulation', fontsize=16, fontweight='bold')
         
         # Main 3D plot
         self.ax_3d = self.fig.add_subplot(2, 2, (1, 2), projection='3d')
-        self.ax_3d.set_title('3D Active Suspension System Simulation')
+        self.ax_3d.set_title('3D Vehicle Dynamics')
         
         # Performance plots
         self.ax_pos = self.fig.add_subplot(2, 2, 3)
@@ -133,10 +157,6 @@ class SuspensionSimulation3D:
         """Initialize 3D visual elements."""
         # Create initial road surface
         self.update_road_surface()
-        
-        # Vehicle body (as a 3D box)
-        self.vehicle_body = None
-        self.wheels = []
         
         # Initialize empty plots for time series
         self.body_line, = self.ax_pos.plot([], [], 'b-', label='Body Position', linewidth=2)
@@ -165,27 +185,20 @@ class SuspensionSimulation3D:
         self.road_buttons = []
         for i, road_name in enumerate(self.road_profiles.keys()):
             ax_button = plt.axes([0.02, 0.95 - i * 0.04, button_width, button_height])
-            button = Button(ax_button, road_name, fontsize=8)
+            button = Button(ax_button, road_name)  # Removed fontsize parameter
             button.on_clicked(lambda event, name=road_name: self.change_road_profile(name))
             self.road_buttons.append(button)
         
         # Control toggle
         ax_toggle = plt.axes([0.02, 0.75, button_width, button_height])
-        self.control_button = Button(ax_toggle, 'Active: ON', fontsize=8)
+        self.control_button = Button(ax_toggle, 'Active: ON')  # Removed fontsize parameter
         self.control_button.on_clicked(self.toggle_control)
         
         # Speed slider
         ax_speed = plt.axes([0.02, 0.68, 0.15, 0.02])
         self.speed_slider = Slider(ax_speed, 'Speed', 5.0, 50.0, valinit=self.road_speed, valfmt='%.1f m/s')
         self.speed_slider.on_changed(self.update_speed)
-        
-    def change_road_profile(self, road_name):
-        """Change the current road profile."""
-        self.current_road_name = road_name
-        self.current_road = self.road_profiles[road_name]
-        self.update_road_surface()
-        print(f"🛣️ Changed road profile to: {road_name}")
-        
+    
     def toggle_control(self, event):
         """Toggle between active and passive control."""
         self.active_control = not self.active_control
@@ -199,8 +212,17 @@ class SuspensionSimulation3D:
         
     def update_road_surface(self):
         """Update the 3D road surface."""
-        if hasattr(self, 'road_surface'):
-            self.road_surface.remove()
+        # Check if 3D plot is initialized
+        if not hasattr(self, 'ax_3d') or self.ax_3d is None:
+            print("⚠️ 3D plot not initialized yet, skipping road surface update")
+            return
+            
+        # Clear previous road surface
+        if hasattr(self, 'road_surface') and self.road_surface is not None:
+            try:
+                self.road_surface.remove()
+            except:
+                pass  # Handle case where surface is already removed
             
         # Create road grid
         x_road = np.linspace(0, self.road_length, self.road_points)
@@ -215,17 +237,31 @@ class SuspensionSimulation3D:
             Z_road[:, i] = road_height
             
         # Plot road surface
-        self.road_surface = self.ax_3d.plot_surface(
-            X_road, Y_road, Z_road, alpha=0.6, cmap='terrain', linewidth=0
-        )
+        try:
+            self.road_surface = self.ax_3d.plot_surface(
+                X_road, Y_road, Z_road, alpha=0.6, cmap='terrain', linewidth=0
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to update road surface: {e}")
+            self.road_surface = None
         
     def create_vehicle_3d(self, x_pos, body_z, wheel_z):
         """Create or update 3D vehicle representation."""
+        # Check if 3D plot is initialized
+        if not hasattr(self, 'ax_3d') or self.ax_3d is None:
+            return
+            
         # Clear previous vehicle elements
         if self.vehicle_body is not None:
-            self.vehicle_body.remove()
+            try:
+                self.vehicle_body.remove()
+            except:
+                pass
         for wheel in self.wheels:
-            wheel.remove()
+            try:
+                wheel.remove()
+            except:
+                pass
         self.wheels.clear()
         
         # Vehicle body (simplified as a rectangular prism)
@@ -249,35 +285,39 @@ class SuspensionSimulation3D:
             [0, 4], [1, 5], [2, 6], [3, 7]   # connecting edges
         ]
         
-        for edge in edges:
-            points = body_vertices[edge]
-            self.ax_3d.plot3D(*points.T, 'b-', linewidth=2, alpha=0.8)
-        
-        # Wheels (as circles)
-        wheel_positions = [
-            (x_pos - self.vehicle_length/3, -self.vehicle_width/3),
-            (x_pos - self.vehicle_length/3, self.vehicle_width/3),
-            (x_pos + self.vehicle_length/3, -self.vehicle_width/3),
-            (x_pos + self.vehicle_length/3, self.vehicle_width/3)
-        ]
-        
-        for wheel_x, wheel_y in wheel_positions:
-            # Create wheel as a circle
-            theta = np.linspace(0, 2*np.pi, 20)
-            wheel_y_circle = wheel_y + self.wheel_radius * np.cos(theta) * 0.3  # Flattened
-            wheel_z_circle = wheel_z + self.wheel_radius * np.sin(theta)
-            wheel_x_circle = np.full_like(theta, wheel_x)
+        try:
+            for edge in edges:
+                points = body_vertices[edge]
+                self.ax_3d.plot3D(*points.T, 'b-', linewidth=2, alpha=0.8)
             
-            wheel_plot = self.ax_3d.plot(wheel_x_circle, wheel_y_circle, wheel_z_circle, 'k-', linewidth=3)
-            self.wheels.extend(wheel_plot)
-        
-        # Spring/damper connections (simplified as lines)
-        for wheel_x, wheel_y in wheel_positions:
-            # Spring line
-            spring_line = self.ax_3d.plot([wheel_x, wheel_x], [wheel_y, wheel_y], 
-                                        [wheel_z + self.wheel_radius, body_z], 
-                                        'g-', linewidth=2, alpha=0.7)
-            self.wheels.extend(spring_line)
+            # Wheels (as circles)
+            wheel_positions = [
+                (x_pos - self.vehicle_length/3, -self.vehicle_width/3),
+                (x_pos - self.vehicle_length/3, self.vehicle_width/3),
+                (x_pos + self.vehicle_length/3, -self.vehicle_width/3),
+                (x_pos + self.vehicle_length/3, self.vehicle_width/3)
+            ]
+            
+            for wheel_x, wheel_y in wheel_positions:
+                # Create wheel as a circle
+                theta = np.linspace(0, 2*np.pi, 20)
+                wheel_y_circle = wheel_y + self.wheel_radius * np.cos(theta) * 0.3  # Flattened
+                wheel_z_circle = wheel_z + self.wheel_radius * np.sin(theta)
+                wheel_x_circle = np.full_like(theta, wheel_x)
+                
+                wheel_plot = self.ax_3d.plot(wheel_x_circle, wheel_y_circle, wheel_z_circle, 'k-', linewidth=3)
+                self.wheels.extend(wheel_plot)
+            
+            # Spring/damper connections (simplified as lines)
+            for wheel_x, wheel_y in wheel_positions:
+                # Spring line
+                spring_line = self.ax_3d.plot([wheel_x, wheel_x], [wheel_y, wheel_y], 
+                                            [wheel_z + self.wheel_radius, body_z], 
+                                            'g-', linewidth=2, alpha=0.7)
+                self.wheels.extend(spring_line)
+                
+        except Exception as e:
+            print(f"⚠️ Failed to create 3D vehicle: {e}")
     
     def update_simulation(self, frame):
         """Update function for animation."""
@@ -370,32 +410,45 @@ Time: {self.time:.1f} s"""
         print("🎮 Use controls to change road profiles and settings")
         print("🎥 The 3D view will slowly rotate for better perspective")
         
+        # Setup plot first
+        self.setup_plot()
+        
         # Reset simulation
         self.suspension.reset()
         self.time = 0.0
         
-        # Create animation
-        self.ani = animation.FuncAnimation(
-            self.fig, self.update_simulation, interval=100,  # 10 FPS for 3D
-            blit=False, cache_frame_data=False
-        )
-        
-        plt.tight_layout()
-        plt.show()
+        try:
+            # Create animation
+            self.ani = animation.FuncAnimation(
+                self.fig, self.update_simulation, interval=100,  # 10 FPS for 3D
+                blit=False, cache_frame_data=False
+            )
+            
+            plt.tight_layout()
+            plt.show()
+            
+        except Exception as e:
+            print(f"❌ 3D Animation error: {e}")
+            print("Showing static plot instead...")
+            plt.show()
 
 # Main execution
 if __name__ == "__main__":
-    print("Choose simulation type:")
-    print("1. 2D Simulation (more detailed)")
-    print("2. 3D Simulation (visual perspective)")
-    
-    choice = input("Enter your choice (1 or 2): ").strip()
-    
-    if choice == "2":
-        sim = SuspensionSimulation3D(dt=0.001)
-        sim.start_simulation()
-    else:
-        # Import and run 2D simulation
-        from suspension_simulation import SuspensionSimulation
-        sim = SuspensionSimulation(dt=0.001)
-        sim.start_simulation()
+    try:
+        print("Choose simulation type:")
+        print("1. 2D Simulation (more detailed)")
+        print("2. 3D Simulation (visual perspective)")
+        
+        choice = input("Enter your choice (1 or 2): ").strip()
+        
+        if choice == "2":
+            sim = SuspensionSimulation3D(dt=0.001)
+            sim.start_simulation()
+        else:
+            # Import and run 2D simulation
+            from suspension_simulation import SuspensionSimulation
+            sim = SuspensionSimulation(dt=0.001)
+            sim.start_simulation()
+    except Exception as e:
+        print(f"❌ Simulation failed: {e}")
+        print("Please check that all required files are available.")
