@@ -25,9 +25,9 @@ class QuadraticQLearning:
                  state_dim=4,
                  action_dim=1, 
                  disturbance_dim=1,
-                 learning_rate=0.0001, # Keep the lower learning rate
+                 learning_rate=0.001, # Keep the lower learning rate
                  gamma=0.95,
-                 exploration_noise=0.2):
+                 exploration_noise=2.0):
         
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -43,13 +43,12 @@ class QuadraticQLearning:
         
         # --- RE-BALANCED WEIGHTS AND SCALES ---
         # Increased energy weight to make it a more important objective
-        self.weight_comfort = 0.4
-        self.weight_energy = 0.3
-        self.weight_handling = 0.3
+        self.weight_comfort = 0.6
+        self.weight_energy = 0.2
+        self.weight_handling = 0.2
         
-        self.comfort_scale = 10.0
+        self.comfort_scale = 5.0
         self.handling_scale = 0.05
-        # A single, unified scale for power flow
         self.power_scale = 100.0 
         
         self.memory = deque(maxlen=20000)
@@ -62,11 +61,11 @@ class QuadraticQLearning:
         self.Q_matrix[:4, :4] = Q_xx
         self.Q_matrix[4, 4] = -0.01
         self.Q_matrix[5, 5] = 0.1
-        self.Q_matrix[:4, 4] = torch.randn(4) * 0.01
+        self.Q_matrix[:4, 4] = torch.randn(4) * 0.1
         self.Q_matrix[4, :4] = self.Q_matrix[:4, 4]
-        self.Q_matrix[:4, 5] = torch.randn(4) * 0.01
+        self.Q_matrix[:4, 5] = torch.randn(4) * 0.1
         self.Q_matrix[5, :4] = self.Q_matrix[:4, 5]
-        self.Q_matrix[4, 5] = torch.randn(1) * 0.01
+        self.Q_matrix[4, 5] = torch.randn(1) * 0.1
         self.Q_matrix[5, 4] = self.Q_matrix[4, 5]
         self.Q_matrix.requires_grad_(True)
 
@@ -95,9 +94,12 @@ class QuadraticQLearning:
         optimal_action = self.get_optimal_action(state, disturbance)
         noise = np.random.normal(0, self.exploration_noise)
         action = optimal_action + noise
-        return np.clip(action, -100.0, 100.0)
+        if np.random.rand() < 0.05:
+            return np.random.uniform(-100.0, 100.0)
+        else:
+            return np.clip(action, -100.0, 100.0)
     
-    # *** NEW, SIMPLIFIED REWARD FUNCTION ***
+    
     def compute_scaled_reward(self, state, action, x_s_ddot, x_g):
         """
         Computes the scaled multi-objective reward with a physically correct energy term.
@@ -116,7 +118,7 @@ class QuadraticQLearning:
         # The net energy reward is simply the negative of the power flow, scaled.
         # If power is consumed (>0), this is a penalty.
         # If power is regenerated (<0), this becomes a reward.
-        energy_reward = -instantaneous_power / self.power_scale
+        energy_reward = -instantaneous_power / self.power_scale - 0.1*abs(action)
         
         # Combine the components into the final reward
         reward = (self.weight_comfort * (-comfort_cost) +
@@ -201,7 +203,7 @@ class QuadraticQLearning:
         if 'hyperparams' in data:
             self.exploration_noise = data['hyperparams'].get('noise', self.exploration_noise)
         
-        episode_num = data.get('episode', 1000)
+        episode_num = data.get('episode', 0)
         print(f"Agent state loaded from {filepath} (trained up to episode {episode_num}).")
         return episode_num
 
@@ -360,7 +362,7 @@ def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agen
             
             avg_reward = np.mean(metrics['episode_rewards'][-100:])
             metrics['avg_rewards'].append(avg_reward)
-            agent.exploration_noise = max(0.01, agent.exploration_noise * 0.995)
+            agent.exploration_noise = max(0.01, agent.exploration_noise * 0.999)
             
             current_episode_num = episode + 1
             #if current_episode_num % 50 == 0 or episode == episodes - 1:

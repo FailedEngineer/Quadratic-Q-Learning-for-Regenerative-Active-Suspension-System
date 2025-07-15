@@ -24,7 +24,7 @@ class QuarterCarModel:
         self.m_u = 15.9    # Unsprung mass (kg) - wheel and axle assembly
         self.k_s = 8799.0 # Suspension spring stiffness (N/m)
         self.k_t = 90000.0# Tire stiffness (N/m)
-        self.c_s = 100.0  # Suspension damping coefficient (Ns/m) - this is the passive component
+        self.c_s = 100.0 # Suspension damping coefficient (Ns/m) - this is the passive component
 
         # --- Actuator Properties (Placeholders) ---
         self.max_force = 100.0 # Maximum actuator force (N)
