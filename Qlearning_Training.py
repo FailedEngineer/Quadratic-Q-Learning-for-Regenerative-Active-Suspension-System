@@ -25,7 +25,7 @@ class QuadraticQLearning:
                  state_dim=4,
                  action_dim=1, 
                  disturbance_dim=1,
-                 learning_rate=0.0001,
+                 learning_rate=0.0001, # Keep the lower learning rate
                  gamma=0.95,
                  exploration_noise=0.2):
         
@@ -41,19 +41,17 @@ class QuadraticQLearning:
         self._initialize_hinf_q_matrix()
         self.optimizer = optim.Adam([self.Q_matrix], lr=learning_rate)
         
-        # --- REWARD FUNCTION PARAMETERS (RE-BALANCED) ---
+        # --- RE-BALANCED WEIGHTS AND SCALES ---
+        # Increased energy weight to make it a more important objective
         self.weight_comfort = 0.4
-        self.weight_energy = 0.2
-        self.weight_handling = 0.4
+        self.weight_energy = 0.3
+        self.weight_handling = 0.3
         
-        # --- NEW SCALING FACTORS ---
-        # These factors normalize the costs. Adjust them based on typical
-        # values observed during a passive run to make them comparable.
-        self.comfort_scale = 10.0    # Expected RMS of body acceleration
-        self.handling_scale = 0.05  # Expected RMS of tire deflection
-        self.power_consumption_scale = 100.0 # Expected RMS of power consumed
-        self.energy_regen_scale = 50.0 # Expected RMS of power regenerated
-
+        self.comfort_scale = 10.0
+        self.handling_scale = 0.05
+        # A single, unified scale for power flow
+        self.power_scale = 100.0 
+        
         self.memory = deque(maxlen=20000)
         self.batch_size = 64
 
@@ -99,29 +97,31 @@ class QuadraticQLearning:
         action = optimal_action + noise
         return np.clip(action, -100.0, 100.0)
     
-    def compute_scaled_reward(self, state, action, x_s_ddot, p_regen, x_g):
+    # *** NEW, SIMPLIFIED REWARD FUNCTION ***
+    def compute_scaled_reward(self, state, action, x_s_ddot, x_g):
         """
-        Computes the SCALED multi-objective reward based on the project proposal.
-        J_k: Passenger Comfort, J_g: Road Handling, J_e: Energy
+        Computes the scaled multi-objective reward with a physically correct energy term.
         """
-        # 1. Comfort Cost (J_k): Penalize body acceleration (m/s^2)
+        # 1. Comfort Cost: Penalize squared body acceleration
         comfort_cost = (x_s_ddot**2) / self.comfort_scale**2
 
-        # 2. Handling Cost (J_g): Penalize tire deflection from the road (m)
-        #    This is the difference between the wheel's position and the road's position.
+        # 2. Handling Cost: Penalize squared tire deflection
         tire_deflection = state[2] - x_g  # x_u - x_g
         handling_cost = (tire_deflection**2) / self.handling_scale**2
         
-        # 3. Net Energy Cost (J_e): Penalize actuator power usage and reward regeneration
+        # 3. Net Energy Reward: Directly reward regeneration and penalize consumption
         relative_velocity = state[1] - state[3]  # x_s_dot - x_u_dot
-        power_consumed = (action * relative_velocity)**2 / self.power_consumption_scale**2
-        power_regenerated = p_regen / self.energy_regen_scale
+        instantaneous_power = action * relative_velocity
         
-        # The goal is to MINIMIZE cost, so rewards are negative costs.
-        # We maximize the reward: R = -w_c*J_k - w_h*J_g + w_e*J_e_net
+        # The net energy reward is simply the negative of the power flow, scaled.
+        # If power is consumed (>0), this is a penalty.
+        # If power is regenerated (<0), this becomes a reward.
+        energy_reward = -instantaneous_power / self.power_scale
+        
+        # Combine the components into the final reward
         reward = (self.weight_comfort * (-comfort_cost) +
                   self.weight_handling * (-handling_cost) +
-                  self.weight_energy * (power_regenerated - power_consumed))
+                  self.weight_energy * energy_reward)
 
         return reward
     
@@ -136,14 +136,14 @@ class QuadraticQLearning:
         
         indices = np.random.choice(len(self.memory), self.batch_size, replace=False)
         batch = [self.memory[i] for i in indices]
-        states, actions, rewards, next_states, disturbances, next_disturbances = zip(*batch)
+        states, actions, rewards, next_states, disturbances, next_disturbance = zip(*batch)
         
         states_t = torch.FloatTensor(np.array(states))
         actions_t = torch.FloatTensor(actions).unsqueeze(1)
         rewards_t = torch.FloatTensor(rewards)
         next_states_t = torch.FloatTensor(np.array(next_states))
         disturbances_t = torch.FloatTensor(disturbances).unsqueeze(1)
-        next_disturbances_t = torch.FloatTensor(next_disturbances).unsqueeze(1)
+        next_disturbances_t = torch.FloatTensor(next_disturbance).unsqueeze(1)
         
         z_current = torch.cat([states_t, actions_t, disturbances_t], dim=1)
         q_current = self.compute_q_value(z_current)
@@ -164,7 +164,7 @@ class QuadraticQLearning:
         loss = nn.functional.mse_loss(q_current, q_target)
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.Q_matrix, 1.0)
+        torch.nn.utils.clip_grad_norm_(self.Q_matrix, 1.0) # Keep gradient clipping
         self.optimizer.step()
         self._enforce_hinf_structure()
         return loss.item()
@@ -346,7 +346,7 @@ def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agen
             while True:
                 action = agent.get_action_with_exploration(state, road_input)
                 next_state, x_s_ddot, p_regen, current_road, next_road, done = env.step(action)
-                reward = agent.compute_scaled_reward(state, action,x_s_ddot, p_regen,current_road)
+                reward = agent.compute_scaled_reward(state, action,x_s_ddot,current_road)
                 agent.store_experience(state, action, reward, next_state, current_road, next_road)
                 loss = agent.update_q_matrix()
                 
