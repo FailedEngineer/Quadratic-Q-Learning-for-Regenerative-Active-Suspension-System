@@ -35,20 +35,19 @@ class BumpProfile(RoadProfileGenerator):
         return profile[0] if t_was_scalar else profile
 
 class SquareWaveProfile(RoadProfileGenerator):
-    """Generates a repeating square wave to simulate periodic bumps."""
+    """Generates a repeating square wave with only raised bumps (unipolar)."""
     def __init__(self, period=2.0, amplitude=0.02):
         self.period = period
         self.amplitude = amplitude
 
     def get_profile(self, t):
-        # Fix: Handle both scalar and array inputs
         t_was_scalar = np.isscalar(t)
         t = np.atleast_1d(t)
+        sine_wave = np.sin(2 * np.pi * t / self.period)
+        bipolar_square = np.sign(sine_wave)
+        unipolar_square = (bipolar_square + 1) / 2
+        profile = self.amplitude * unipolar_square
         
-        # Generates a square wave: +amplitude for the first half, -amplitude for the second.
-        profile = self.amplitude * np.sign(np.sin(2 * np.pi * t / self.period))
-        
-        # Return scalar if input was scalar
         return profile[0] if t_was_scalar else profile
 
 class ISO8608Profile(RoadProfileGenerator):

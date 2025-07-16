@@ -25,7 +25,7 @@ class QuadraticQLearning:
                  state_dim=4,
                  action_dim=1, 
                  disturbance_dim=1,
-                 learning_rate=0.001, # Keep the lower learning rate
+                 learning_rate=0.0001, 
                  gamma=0.95,
                  exploration_noise=2.0):
         
@@ -43,12 +43,12 @@ class QuadraticQLearning:
         
         # --- RE-BALANCED WEIGHTS AND SCALES ---
         # Increased energy weight to make it a more important objective
-        self.weight_comfort = 0.6
-        self.weight_energy = 0.2
+        self.weight_comfort = 0.7
+        self.weight_energy = 0.1
         self.weight_handling = 0.2
         
-        self.comfort_scale = 5.0
-        self.handling_scale = 0.05
+        self.comfort_scale = 0.1
+        self.handling_scale = 2.0
         self.power_scale = 100.0 
         
         self.memory = deque(maxlen=20000)
@@ -83,7 +83,7 @@ class QuadraticQLearning:
         Q_xu = self.Q_matrix[:4, 4]
         Q_uu = self.Q_matrix[4, 4]
         Q_uw = self.Q_matrix[4, 5]
-        if abs(Q_uu) > 1e-6:
+        if abs(Q_uu) > 1e-3:
             optimal_action = -(Q_xu @ state_t + Q_uw * disturbance_t) / Q_uu
         else:
             optimal_action = torch.tensor(0.0)
@@ -118,7 +118,7 @@ class QuadraticQLearning:
         # The net energy reward is simply the negative of the power flow, scaled.
         # If power is consumed (>0), this is a penalty.
         # If power is regenerated (<0), this becomes a reward.
-        energy_reward = -instantaneous_power / self.power_scale - 0.1*abs(action)
+        energy_reward = -instantaneous_power / self.power_scale
         
         # Combine the components into the final reward
         reward = (self.weight_comfort * (-comfort_cost) +
@@ -154,7 +154,7 @@ class QuadraticQLearning:
             Q_xu = self.Q_matrix[:4, 4]
             Q_uu = self.Q_matrix[4, 4]
             Q_uw = self.Q_matrix[4, 5]
-            if abs(Q_uu) > 1e-6:
+            if abs(Q_uu) > 1e-3:
                 numerator = (next_states_t @ Q_xu) + (Q_uw * next_disturbances_t).squeeze()
                 next_actions_t = -(numerator / Q_uu).unsqueeze(1)
             else:
@@ -180,13 +180,14 @@ class QuadraticQLearning:
             if self.Q_matrix[5, 5] < 1e-6:
                 self.Q_matrix[5, 5] = 1e-6
 
-    def save_agent(self, filepath, episode_num):
-        """Saves the trained agent's state and current episode number."""
+    def save_agent(self, filepath, episode_num, metrics=None):
+        """Saves the trained agent's state, current episode number, and metrics."""
         save_dict = {
             'episode': episode_num,
             'Q_matrix': self.Q_matrix.detach().numpy(),
             'hyperparams': {'lr': self.learning_rate, 'gamma': self.gamma, 'noise': self.exploration_noise},
-            'weights': {'comfort': self.weight_comfort, 'energy': self.weight_energy, 'handling': self.weight_handling}
+            'weights': {'comfort': self.weight_comfort, 'energy': self.weight_energy, 'handling': self.weight_handling},
+            'metrics': metrics  # Save the complete metrics history
         }
         dir_name = os.path.dirname(filepath)
         if dir_name:
@@ -195,7 +196,7 @@ class QuadraticQLearning:
         print(f"Agent state for episode {episode_num} saved to {filepath}")
     
     def load_agent(self, filepath):
-        """Loads a trained agent's state and returns the episode number."""
+        """Loads a trained agent's state and returns the episode number and metrics."""
         data = np.load(filepath, allow_pickle=True).item()
         self.Q_matrix = torch.FloatTensor(data['Q_matrix'])
         self.Q_matrix.requires_grad_(True)
@@ -204,8 +205,9 @@ class QuadraticQLearning:
             self.exploration_noise = data['hyperparams'].get('noise', self.exploration_noise)
         
         episode_num = data.get('episode', 0)
+        metrics = data.get('metrics', None)  # Load the complete metrics history
         print(f"Agent state loaded from {filepath} (trained up to episode {episode_num}).")
-        return episode_num
+        return episode_num, metrics
 
 class SuspensionEnvironment:
     """Environment wrapper for the suspension system."""
@@ -234,24 +236,26 @@ class SuspensionEnvironment:
 
 def plot_training_results(metrics, agent, save_path=None):
     """
-    Plots the key metrics from the training process.
-    If save_path is provided, saves the plot instead of showing it.
+    Plots the key metrics from the training process showing complete history from episode 0.
     """
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle("Training Performance with Scaled Rewards", fontsize=16)
     axes = axes.flatten()
     
-    axes[0].plot(metrics['episode_rewards'], alpha=0.5, label='Episode Reward')
-    axes[0].plot(metrics['avg_rewards'], color='red', linewidth=2, label='100-Ep Avg Reward')
+    # Episode numbers always start from 0 and go to current length
+    episode_numbers = range(len(metrics['episode_rewards']))
+    
+    axes[0].plot(episode_numbers, metrics['episode_rewards'], alpha=0.5, label='Episode Reward')
+    axes[0].plot(episode_numbers, metrics['avg_rewards'], color='red', linewidth=2, label='100-Ep Avg Reward')
     axes[0].set_title('Episode Rewards'); axes[0].set_xlabel('Episode'); axes[0].set_ylabel('Total Reward'); axes[0].legend(); axes[0].grid(True)
     
-    axes[1].plot(metrics['td_losses']); axes[1].set_title('Average TD Loss'); axes[1].set_xlabel('Episode'); axes[1].set_ylabel('MSE Loss'); axes[1].grid(True)
+    axes[1].plot(episode_numbers, metrics['td_losses']); axes[1].set_title('Average TD Loss'); axes[1].set_xlabel('Episode'); axes[1].set_ylabel('MSE Loss'); axes[1].grid(True)
     
-    axes[2].plot(metrics['comfort_scores']); axes[2].set_title('Comfort Metric (Lower is Better)'); axes[2].set_xlabel('Episode'); axes[2].set_ylabel('Average Acceleration²'); axes[2].set_yscale('log'); axes[2].grid(True)
+    axes[2].plot(episode_numbers, metrics['comfort_scores']); axes[2].set_title('Comfort Metric (Lower is Better)'); axes[2].set_xlabel('Episode'); axes[2].set_ylabel('Average Acceleration²'); axes[2].set_yscale('log'); axes[2].grid(True)
     
-    axes[3].plot(metrics['energy_scores']); axes[3].set_title('Energy Recovery'); axes[3].set_xlabel('Episode'); axes[3].set_ylabel('Total Regenerated Power (W)'); axes[3].grid(True)
+    axes[3].plot(episode_numbers, metrics['energy_scores']); axes[3].set_title('Energy Recovery'); axes[3].set_xlabel('Episode'); axes[3].set_ylabel('Total Regenerated Power (W)'); axes[3].grid(True)
     
-    axes[4].plot(metrics['q_matrix_norms']); axes[4].set_title('Q-Matrix Evolution (Frobenius Norm)'); axes[4].set_xlabel('Episode'); axes[4].set_ylabel('Norm'); axes[4].grid(True)
+    axes[4].plot(episode_numbers, metrics['q_matrix_norms']); axes[4].set_title('Q-Matrix Evolution (Frobenius Norm)'); axes[4].set_xlabel('Episode'); axes[4].set_ylabel('Norm'); axes[4].grid(True)
     
     final_q = agent.Q_matrix.detach().numpy()
     im = axes[5].imshow(final_q, cmap='RdBu_r', vmin=-np.max(np.abs(final_q)), vmax=np.max(np.abs(final_q)))
@@ -272,7 +276,7 @@ def plot_training_results(metrics, agent, save_path=None):
 
 def find_and_load_latest_agent(agent, checkpoint_dir="checkpoints", final_agent_name="trained_suspension_agent_v3.npy"):
     """
-    Finds the agent with the highest episode number, loads it, and returns the next episode to run.
+    Finds the agent with the highest episode number, loads it, and returns the next episode to run and metrics.
     This is more robust than checking modification times.
     """
     candidate_files = {}
@@ -296,7 +300,7 @@ def find_and_load_latest_agent(agent, checkpoint_dir="checkpoints", final_agent_
 
     if not all_files_to_check:
         print("No saved agent found. Starting training from scratch.")
-        return 0
+        return 0, None
 
     # 2. For each file, read the episode number stored inside it
     for f in all_files_to_check:
@@ -305,33 +309,43 @@ def find_and_load_latest_agent(agent, checkpoint_dir="checkpoints", final_agent_
     # 3. Find the file path corresponding to the highest episode number
     if not candidate_files:
         print("Could not read episode number from any saved agent. Starting from scratch.")
-        return 0
+        return 0, None
         
     latest_file = max(candidate_files, key=candidate_files.get)
     
-    # 4. Load the agent and return the next episode number to start from
+    # 4. Load the agent and return the next episode number to start from and metrics
     print(f"Resuming training from the most advanced state found: {latest_file}")
-    last_episode = agent.load_agent(latest_file)
+    last_episode, loaded_metrics = agent.load_agent(latest_file)
     
-    return last_episode
+    return last_episode, loaded_metrics
 
 def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agent_v3.npy", checkpoint_interval=100, plot_interval=100):
-    """Main training loop with auto-resume, checkpointing, and non-blocking plotting."""
+    """Main training loop with auto-resume, checkpointing, and continuous plotting from episode 0."""
     
     agent = QuadraticQLearning()
     
     plots_dir = "plots"
     os.makedirs(plots_dir, exist_ok=True)
     
-    # *** NEW: Use the robust resume logic ***
-    start_episode = find_and_load_latest_agent(agent)
+    # Load the latest agent and metrics
+    start_episode, loaded_metrics = find_and_load_latest_agent(agent)
     
     if start_episode >= episodes:
         print(f"Training already completed up to episode {start_episode}. Target is {episodes}. Exiting.")
         return agent, None
 
+    # Initialize metrics - either from loaded state or fresh
+    if loaded_metrics is not None:
+        # Continue from loaded metrics (contains complete history from episode 0)
+        metrics = loaded_metrics
+        print(f"Loaded complete training history. Continuing from episode {start_episode}.")
+        print(f"Metrics contain {len(metrics['episode_rewards'])} episodes of history.")
+    else:
+        # Start fresh
+        metrics = {'episode_rewards': [], 'avg_rewards': [], 'td_losses': [], 'comfort_scores': [], 'energy_scores': [], 'q_matrix_norms': []}
+        print("Starting training from scratch.")
+
     env = SuspensionEnvironment()
-    metrics = {'episode_rewards': [], 'avg_rewards': [], 'td_losses': [], 'comfort_scores': [], 'energy_scores': [], 'q_matrix_norms': []}
     
     print("🚀 Starting Training with SCALED REWARD FUNCTION...")
     print(f"Hyperparams: LR={agent.learning_rate}, Gamma={agent.gamma}, Noise={agent.exploration_noise}")
@@ -356,22 +370,34 @@ def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agen
                 step_count += 1; state = next_state; road_input = next_road
                 if done: break
             
-            metrics['episode_rewards'].append(episode_reward); metrics['comfort_scores'].append(episode_comfort / step_count)
-            metrics['energy_scores'].append(episode_energy); avg_loss = episode_loss / step_count if step_count > 0 else 0
-            metrics['td_losses'].append(avg_loss); metrics['q_matrix_norms'].append(torch.norm(agent.Q_matrix).item())
+            # Append new metrics to the complete history
+            metrics['episode_rewards'].append(episode_reward)
+            metrics['comfort_scores'].append(episode_comfort / step_count)
+            metrics['energy_scores'].append(episode_energy)
+            avg_loss = episode_loss / step_count if step_count > 0 else 0
+            metrics['td_losses'].append(avg_loss)
+            metrics['q_matrix_norms'].append(torch.norm(agent.Q_matrix).item())
             
+            # Calculate average over the last 100 episodes (or all episodes if less than 100)
             avg_reward = np.mean(metrics['episode_rewards'][-100:])
             metrics['avg_rewards'].append(avg_reward)
             agent.exploration_noise = max(0.01, agent.exploration_noise * 0.999)
             
             current_episode_num = episode + 1
-            #if current_episode_num % 50 == 0 or episode == episodes - 1:
+            
             print(f"Ep {current_episode_num:4d}/{episodes} | Avg Reward: {avg_reward:8.3f} | Avg Loss: {metrics['td_losses'][-1]:.4f} | Noise: {agent.exploration_noise:.3f}")
+            if current_episode_num % 50 == 0:
+                q_matrix_condition = torch.linalg.cond(agent.Q_matrix).item()
+                print(f"Q-matrix condition number: {q_matrix_condition:.2e}")
+                if q_matrix_condition > 1e12:
+                    print("⚠️ Q-matrix becoming ill-conditioned!")
 
+            # Save checkpoints with complete metrics history
             if current_episode_num % checkpoint_interval == 0:
                 checkpoint_path = os.path.join("checkpoints", f"checkpoint_episode_{current_episode_num}.npy")
-                agent.save_agent(checkpoint_path, current_episode_num)
+                agent.save_agent(checkpoint_path, current_episode_num, metrics)
 
+            # Plot complete history from episode 0 to current
             if current_episode_num % plot_interval == 0:
                 plot_path = os.path.join(plots_dir, f"progress_episode_{current_episode_num}.png")
                 plot_training_results(metrics, agent, save_path=plot_path)
@@ -379,11 +405,13 @@ def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agen
     except KeyboardInterrupt:
         print("\n\n🛑 Training interrupted by user.")
         interrupted_save_path = "INTERRUPTED_agent.npy"
-        agent.save_agent(interrupted_save_path, episode)
+        # Save complete metrics history with interrupted agent
+        agent.save_agent(interrupted_save_path, episode, metrics)
         print("Gracefully exiting.")
         sys.exit(0)
 
-    agent.save_agent(save_path, episodes)
+    # Save final agent with complete metrics history
+    agent.save_agent(save_path, episodes, metrics)
     print("\n🎉 Training Complete!")
     return agent, metrics
 
@@ -392,4 +420,5 @@ if __name__ == "__main__":
     agent, training_metrics = train_quadratic_q_learning(episodes=15000)
     
     if training_metrics:
+        # Final plot shows complete history from episode 0 to final episode
         plot_training_results(training_metrics, agent, save_path="final_training_plot.png")
