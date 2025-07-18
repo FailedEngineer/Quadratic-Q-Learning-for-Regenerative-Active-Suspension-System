@@ -47,7 +47,7 @@ class QuadraticQLearning:
         self.weight_energy = 0.1
         self.weight_handling = 0.2
         
-        self.comfort_scale = 0.1
+        self.comfort_scale = 1.0
         self.handling_scale = 2.0
         self.power_scale = 100.0 
         
@@ -381,7 +381,7 @@ def train_quadratic_q_learning(episodes=1000, save_path="trained_suspension_agen
             # Calculate average over the last 100 episodes (or all episodes if less than 100)
             avg_reward = np.mean(metrics['episode_rewards'][-100:])
             metrics['avg_rewards'].append(avg_reward)
-            agent.exploration_noise = max(0.01, agent.exploration_noise * 0.999)
+            agent.exploration_noise = max(0.01, agent.exploration_noise * 0.995)
             
             current_episode_num = episode + 1
             
